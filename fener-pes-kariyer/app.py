@@ -33,117 +33,204 @@ FENER_GREEN_PITCH = "#0f6b3e"
 FENER_GREEN_LINE = "#bde5c8"
 
 
-# ---------------- DB ----------------
+# ---------------- DB (HYBRID: SQLite local, Postgres cloud) ----------------
+from sqlalchemy import create_engine, text
+
+def using_postgres() -> bool:
+    try:
+        return bool(st.secrets.get("postgresql://postgres.ugpwrtmsblzgyopvtcss:Eoracle1717.@aws-1-eu-west-1.pooler.supabase.com:6543/postgres"))
+    except Exception:
+        return False
+
+_ENGINE = None
+
+def get_engine():
+    global _ENGINE
+    if _ENGINE is None:
+        _ENGINE = create_engine(st.secrets["postgresql://postgres.ugpwrtmsblzgyopvtcss:Eoracle1717.@aws-1-eu-west-1.pooler.supabase.com:6543/postgres"], pool_pre_ping=True)
+    return _ENGINE
+
+# --- SQLite helpers (eski düzen) ---
 def get_conn():
     conn = sqlite3.connect(DB_PATH)
     conn.execute("PRAGMA foreign_keys = ON;")
     return conn
 
+# --- Postgres exec/read ---
+def pg_exec(sql: str, params: dict | None = None):
+    eng = get_engine()
+    with eng.begin() as conn:
+        conn.execute(text(sql), params or {})
 
+def pg_read(sql: str, params: dict | None = None) -> pd.DataFrame:
+    eng = get_engine()
+    return pd.read_sql_query(text(sql), eng, params=params or {})
+
+# ---------------- init_db ----------------
 def init_db():
-    conn = get_conn()
-    cur = conn.cursor()
+    if using_postgres():
+        pg_exec("""
+        CREATE TABLE IF NOT EXISTS players (
+            player_id BIGSERIAL PRIMARY KEY,
+            name TEXT NOT NULL UNIQUE,
+            pos TEXT NOT NULL
+        );
+        """)
+        pg_exec("""
+        CREATE TABLE IF NOT EXISTS stats (
+            stat_id BIGSERIAL PRIMARY KEY,
+            player_id BIGINT NOT NULL REFERENCES players(player_id) ON DELETE CASCADE,
+            season TEXT NOT NULL,
+            scope TEXT NOT NULL,
+            mp INTEGER NOT NULL DEFAULT 0,
+            goals INTEGER NOT NULL DEFAULT 0,
+            assists INTEGER NOT NULL DEFAULT 0,
+            rating DOUBLE PRECISION,
+            UNIQUE(player_id, season, scope)
+        );
+        """)
+    else:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS players (
+            player_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            pos TEXT NOT NULL
+        );
+        """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS stats (
+            stat_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            player_id INTEGER NOT NULL,
+            season TEXT NOT NULL,
+            scope TEXT NOT NULL,
+            mp INTEGER NOT NULL DEFAULT 0,
+            goals INTEGER NOT NULL DEFAULT 0,
+            assists INTEGER NOT NULL DEFAULT 0,
+            rating REAL,
+            UNIQUE(player_id, season, scope),
+            FOREIGN KEY(player_id) REFERENCES players(player_id) ON DELETE CASCADE
+        );
+        """)
+        conn.commit()
+        conn.close()
 
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS players (
-        player_id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT NOT NULL UNIQUE,
-        pos TEXT NOT NULL
-    );
-    """)
-
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS stats (
-        stat_id INTEGER PRIMARY KEY AUTOINCREMENT,
-        player_id INTEGER NOT NULL,
-        season TEXT NOT NULL,
-        scope TEXT NOT NULL,
-        mp INTEGER NOT NULL DEFAULT 0,
-        goals INTEGER NOT NULL DEFAULT 0,
-        assists INTEGER NOT NULL DEFAULT 0,
-        rating REAL,
-        UNIQUE(player_id, season, scope),
-        FOREIGN KEY(player_id) REFERENCES players(player_id) ON DELETE CASCADE
-    );
-    """)
-
-    conn.commit()
-    conn.close()
-
-
+# ---------------- players ----------------
 def upsert_player(name: str, pos: str):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("INSERT OR IGNORE INTO players(name,pos) VALUES(?,?)", (name.strip(), pos))
-    cur.execute("UPDATE players SET pos=? WHERE name=?", (pos, name.strip()))
-    conn.commit()
-    conn.close()
-
+    name = name.strip()
+    if using_postgres():
+        pg_exec("""
+            INSERT INTO players(name,pos)
+            VALUES(:name,:pos)
+            ON CONFLICT(name) DO UPDATE SET pos=EXCLUDED.pos
+        """, {"name": name, "pos": pos})
+    else:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("INSERT OR IGNORE INTO players(name,pos) VALUES(?,?)", (name, pos))
+        cur.execute("UPDATE players SET pos=? WHERE name=?", (pos, name))
+        conn.commit()
+        conn.close()
 
 def get_players_df():
-    conn = get_conn()
-    df = pd.read_sql_query("SELECT player_id, name, pos FROM players ORDER BY name COLLATE NOCASE", conn)
-    conn.close()
-    return df
+    if using_postgres():
+        return pg_read("SELECT player_id, name, pos FROM players ORDER BY name")
+    else:
+        conn = get_conn()
+        df = pd.read_sql_query("SELECT player_id, name, pos FROM players ORDER BY name COLLATE NOCASE", conn)
+        conn.close()
+        return df
 
-
+# ---------------- stats ----------------
 def upsert_stat(player_id: int, season: str, scope: str, mp: int, goals: int, assists: int, rating):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("""
-    INSERT INTO stats(player_id, season, scope, mp, goals, assists, rating)
-    VALUES(?,?,?,?,?,?,?)
-    ON CONFLICT(player_id, season, scope) DO UPDATE SET
-        mp=excluded.mp,
-        goals=excluded.goals,
-        assists=excluded.assists,
-        rating=excluded.rating
-    """, (player_id, season, scope, mp, goals, assists, rating))
-    conn.commit()
-    conn.close()
-
+    if using_postgres():
+        pg_exec("""
+        INSERT INTO stats(player_id, season, scope, mp, goals, assists, rating)
+        VALUES(:pid,:season,:scope,:mp,:goals,:assists,:rating)
+        ON CONFLICT(player_id, season, scope) DO UPDATE SET
+            mp=EXCLUDED.mp,
+            goals=EXCLUDED.goals,
+            assists=EXCLUDED.assists,
+            rating=EXCLUDED.rating
+        """, {"pid": player_id, "season": season, "scope": scope, "mp": mp, "goals": goals, "assists": assists, "rating": rating})
+    else:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("""
+        INSERT INTO stats(player_id, season, scope, mp, goals, assists, rating)
+        VALUES(?,?,?,?,?,?,?)
+        ON CONFLICT(player_id, season, scope) DO UPDATE SET
+            mp=excluded.mp,
+            goals=excluded.goals,
+            assists=excluded.assists,
+            rating=excluded.rating
+        """, (player_id, season, scope, mp, goals, assists, rating))
+        conn.commit()
+        conn.close()
 
 def delete_player_season(player_id: int, season: str):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM stats WHERE player_id=? AND season=?", (player_id, season))
-    conn.commit()
-    conn.close()
-
+    if using_postgres():
+        pg_exec("DELETE FROM stats WHERE player_id=:pid AND season=:season", {"pid": player_id, "season": season})
+    else:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM stats WHERE player_id=? AND season=?", (player_id, season))
+        conn.commit()
+        conn.close()
 
 def fetch_one_stat(player_id: int, season: str, scope: str):
-    conn = get_conn()
-    df = pd.read_sql_query("""
-        SELECT mp, goals, assists, rating
-        FROM stats
-        WHERE player_id=? AND season=? AND scope=?
-        LIMIT 1
-    """, conn, params=[player_id, season, scope])
-    conn.close()
+    if using_postgres():
+        df = pg_read("""
+            SELECT mp, goals, assists, rating
+            FROM stats
+            WHERE player_id=:pid AND season=:season AND scope=:scope
+            LIMIT 1
+        """, {"pid": player_id, "season": season, "scope": scope})
+    else:
+        conn = get_conn()
+        df = pd.read_sql_query("""
+            SELECT mp, goals, assists, rating
+            FROM stats
+            WHERE player_id=? AND season=? AND scope=?
+            LIMIT 1
+        """, conn, params=[player_id, season, scope])
+        conn.close()
     return None if df.empty else df.iloc[0].to_dict()
 
-
 def fetch_stats(season: str | None, scope: str):
-    conn = get_conn()
-    params = [scope]
-    q = """
-    SELECT p.name, p.pos, s.season, s.scope, s.mp, s.goals, s.assists, s.rating
-    FROM stats s
-    JOIN players p ON p.player_id = s.player_id
-    WHERE s.scope = ?
-    """
-    if season and season != "Hepsi":
-        q += " AND s.season = ?"
-        params.append(season)
-    q += " ORDER BY p.pos, p.name COLLATE NOCASE"
-    df = pd.read_sql_query(q, conn, params=params)
-    conn.close()
-    return df
-
+    if using_postgres():
+        q = """
+        SELECT p.name, p.pos, s.season, s.scope, s.mp, s.goals, s.assists, s.rating
+        FROM stats s
+        JOIN players p ON p.player_id = s.player_id
+        WHERE s.scope = :scope
+        """
+        params = {"scope": scope}
+        if season and season != "Hepsi":
+            q += " AND s.season = :season"
+            params["season"] = season
+        q += " ORDER BY p.pos, p.name"
+        return pg_read(q, params)
+    else:
+        conn = get_conn()
+        params = [scope]
+        q = """
+        SELECT p.name, p.pos, s.season, s.scope, s.mp, s.goals, s.assists, s.rating
+        FROM stats s
+        JOIN players p ON p.player_id = s.player_id
+        WHERE s.scope = ?
+        """
+        if season and season != "Hepsi":
+            q += " AND s.season = ?"
+            params.append(season)
+        q += " ORDER BY p.pos, p.name COLLATE NOCASE"
+        df = pd.read_sql_query(q, conn, params=params)
+        conn.close()
+        return df
 
 def fetch_stats_agg(scope: str):
-    conn = get_conn()
-    q = """
+    q_pg = """
     SELECT
         p.name,
         p.pos,
@@ -159,32 +246,65 @@ def fetch_stats_agg(scope: str):
         END AS rating
     FROM stats s
     JOIN players p ON p.player_id = s.player_id
-    WHERE s.scope = ?
+    WHERE s.scope = :scope
     GROUP BY p.player_id, p.name, p.pos
-    ORDER BY p.pos, p.name COLLATE NOCASE
+    ORDER BY p.pos, p.name
     """
-    df = pd.read_sql_query(q, conn, params=[scope])
-    conn.close()
-    return df
-
+    if using_postgres():
+        return pg_read(q_pg, {"scope": scope})
+    else:
+        conn = get_conn()
+        q_sqlite = q_pg.replace(":scope", "?") + " COLLATE NOCASE"
+        # sqlite tarafında ORDER BY satırını zaten seninki gibi bırakalım:
+        q_sqlite = """
+        SELECT
+            p.name,
+            p.pos,
+            SUM(s.mp) AS mp,
+            SUM(s.goals) AS goals,
+            SUM(s.assists) AS assists,
+            CASE
+                WHEN SUM(CASE WHEN s.rating IS NOT NULL THEN s.mp ELSE 0 END) > 0
+                THEN
+                    SUM(CASE WHEN s.rating IS NOT NULL THEN s.rating * s.mp ELSE 0 END)
+                    / SUM(CASE WHEN s.rating IS NOT NULL THEN s.mp ELSE 0 END)
+                ELSE NULL
+            END AS rating
+        FROM stats s
+        JOIN players p ON p.player_id = s.player_id
+        WHERE s.scope = ?
+        GROUP BY p.player_id, p.name, p.pos
+        ORDER BY p.pos, p.name COLLATE NOCASE
+        """
+        df = pd.read_sql_query(q_sqlite, conn, params=[scope])
+        conn.close()
+        return df
 
 def recompute_general_for_player_season(player_id: int, season: str):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("""
-    SELECT mp, goals, assists, rating
-    FROM stats
-    WHERE player_id=? AND season=? AND scope IN ('Lig','Kupa','Avrupa')
-    """, (player_id, season))
-    rows = cur.fetchall()
-    conn.close()
+    if using_postgres():
+        df = pg_read("""
+            SELECT mp, goals, assists, rating
+            FROM stats
+            WHERE player_id=:pid AND season=:season AND scope IN ('Lig','Kupa','Avrupa')
+        """, {"pid": player_id, "season": season})
+        rows = df.to_records(index=False)
+    else:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT mp, goals, assists, rating
+            FROM stats
+            WHERE player_id=? AND season=? AND scope IN ('Lig','Kupa','Avrupa')
+        """, (player_id, season))
+        rows = cur.fetchall()
+        conn.close()
 
     if not rows:
         return
 
     mp_sum = sum(r[0] or 0 for r in rows)
-    g_sum = sum(r[1] or 0 for r in rows)
-    a_sum = sum(r[2] or 0 for r in rows)
+    g_sum  = sum(r[1] or 0 for r in rows)
+    a_sum  = sum(r[2] or 0 for r in rows)
 
     num = 0.0
     den = 0
@@ -196,32 +316,47 @@ def recompute_general_for_player_season(player_id: int, season: str):
         den += mp
     general_rating = (num / den) if den > 0 else None
 
-    upsert_stat(player_id, season, "Genel", mp_sum, g_sum, a_sum, general_rating)
-
+    upsert_stat(player_id, season, "Genel", int(mp_sum), int(g_sum), int(a_sum), general_rating)
 
 def fetch_player_scope_season_rows(player_id: int, scope: str):
-    conn = get_conn()
-    df = pd.read_sql_query("""
-        SELECT season, mp, goals, assists, rating
-        FROM stats
-        WHERE player_id=? AND scope=?
-        ORDER BY season
-    """, conn, params=[player_id, scope])
-    conn.close()
-    return df
-
+    if using_postgres():
+        return pg_read("""
+            SELECT season, mp, goals, assists, rating
+            FROM stats
+            WHERE player_id=:pid AND scope=:scope
+            ORDER BY season
+        """, {"pid": player_id, "scope": scope})
+    else:
+        conn = get_conn()
+        df = pd.read_sql_query("""
+            SELECT season, mp, goals, assists, rating
+            FROM stats
+            WHERE player_id=? AND scope=?
+            ORDER BY season
+        """, conn, params=[player_id, scope])
+        conn.close()
+        return df
 
 def fetch_season_records(scope: str):
-    conn = get_conn()
-    df = pd.read_sql_query("""
-        SELECT p.name, p.pos, s.season, s.mp, s.goals, s.assists, s.rating
-        FROM stats s
-        JOIN players p ON p.player_id = s.player_id
-        WHERE s.scope = ?
-        ORDER BY s.season
-    """, conn, params=[scope])
-    conn.close()
-    return df
+    if using_postgres():
+        return pg_read("""
+            SELECT p.name, p.pos, s.season, s.mp, s.goals, s.assists, s.rating
+            FROM stats s
+            JOIN players p ON p.player_id = s.player_id
+            WHERE s.scope = :scope
+            ORDER BY s.season
+        """, {"scope": scope})
+    else:
+        conn = get_conn()
+        df = pd.read_sql_query("""
+            SELECT p.name, p.pos, s.season, s.mp, s.goals, s.assists, s.rating
+            FROM stats s
+            JOIN players p ON p.player_id = s.player_id
+            WHERE s.scope = ?
+            ORDER BY s.season
+        """, conn, params=[scope])
+        conn.close()
+        return df
 
 
 # ---------------- Helpers ----------------

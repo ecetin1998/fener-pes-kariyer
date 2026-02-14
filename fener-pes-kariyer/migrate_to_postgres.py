@@ -6,7 +6,7 @@ from sqlalchemy import create_engine, text
 SQLITE_PATH = Path("pes_kariyer.db")
 
 # 1) Buraya Supabase URI'ni yapıştır (Streamlit secrets'teki ile aynı)
-DATABASE_URL = "postgresql://postgres:Eoracle1717.@db.ugpwrtmsblzgyopvtcss.supabase.co:5432/postgres"
+DATABASE_URL = "postgresql://postgres.ugpwrtmsblzgyopvtcss:Eoracle1717.@aws-1-eu-west-1.pooler.supabase.com:6543/postgres"
 
 def main():
     if not SQLITE_PATH.exists():
