@@ -802,6 +802,15 @@ init_db()
 st.write("Secrets keys:", list(st.secrets.keys()))
 st.write("Has DATABASE_URL:", "DATABASE_URL" in st.secrets)
 
+from sqlalchemy import create_engine, text
+
+try:
+    eng = create_engine(st.secrets["DATABASE_URL"], pool_pre_ping=True)
+    cnt = pd.read_sql_query(text("SELECT COUNT(*) AS cnt FROM players"), eng)
+    st.write("players count:", int(cnt.iloc[0]["cnt"]))
+except Exception as e:
+    st.error(e)
+
 st.write("Postgres aktif mi?", using_postgres())
 if using_postgres():
     try:
@@ -1246,5 +1255,6 @@ else:
             "rating": "Rating", "katki": "Katkı Skoru"
         }, inplace=True)
         show_df(df_ts10)
+
 
 
