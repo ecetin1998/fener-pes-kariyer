@@ -37,10 +37,7 @@ FENER_GREEN_LINE = "#bde5c8"
 from sqlalchemy import create_engine, text
 
 def using_postgres() -> bool:
-    try:
-        return bool(st.secrets.get("postgresql://postgres.ugpwrtmsblzgyopvtcss:Eoracle1717.@aws-1-eu-west-1.pooler.supabase.com:6543/postgres"))
-    except Exception:
-        return False
+    return "DATABASE_URL" in st.secrets and bool(st.secrets["postgresql://postgres.ugpwrtmsblzgyopvtcss:Eoracle1717.@aws-1-eu-west-1.pooler.supabase.com:6543/postgres"])
 
 _ENGINE = None
 
@@ -799,9 +796,6 @@ div[data-testid="stMainBlockContainer"] > div:first-child {{
 
 init_db()
 
-st.write("Secrets keys:", list(st.secrets.keys()))
-st.write("Has DATABASE_URL:", "DATABASE_URL" in st.secrets)
-
 from sqlalchemy import create_engine, text
 
 try:
@@ -810,14 +804,6 @@ try:
     st.write("players count:", int(cnt.iloc[0]["cnt"]))
 except Exception as e:
     st.error(e)
-
-st.write("Postgres aktif mi?", using_postgres())
-if using_postgres():
-    try:
-        c = pg_read("SELECT COUNT(*) AS cnt FROM players")
-        st.write("players count:", int(c.iloc[0]["cnt"]))
-    except Exception as e:
-        st.error(e)
 
 if "page" not in st.session_state:
     st.session_state["page"] = PAGES["Giriş"]
@@ -1255,6 +1241,7 @@ else:
             "rating": "Rating", "katki": "Katkı Skoru"
         }, inplace=True)
         show_df(df_ts10)
+
 
 
 
