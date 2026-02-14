@@ -799,6 +799,9 @@ div[data-testid="stMainBlockContainer"] > div:first-child {{
 
 init_db()
 
+st.write("Secrets keys:", list(st.secrets.keys()))
+st.write("Has DATABASE_URL:", "DATABASE_URL" in st.secrets)
+
 st.write("Postgres aktif mi?", using_postgres())
 if using_postgres():
     try:
@@ -1243,4 +1246,5 @@ else:
             "rating": "Rating", "katki": "Katkı Skoru"
         }, inplace=True)
         show_df(df_ts10)
+
 
