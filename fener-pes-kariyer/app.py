@@ -4,6 +4,7 @@ import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 from streamlit_searchbox import st_searchbox
+from sqlalchemy import create_engine, text
 
 DB_PATH = Path("pes_kariyer.db")
 LOGO_PATH = Path("fener_logo.png")  # aynı klasör
@@ -33,40 +34,37 @@ FENER_GREEN_PITCH = "#0f6b3e"
 FENER_GREEN_LINE = "#bde5c8"
 
 
-# ---------------- DB (HYBRID: SQLite local, Postgres cloud) ----------------
-from sqlalchemy import create_engine, text
-
+# ---------------- DB (HYBRID + PERF) ----------------
 def using_postgres() -> bool:
     try:
         return bool(st.secrets.get("DATABASE_URL"))
     except Exception:
         return False
 
-_ENGINE = None
 
+@st.cache_resource(show_spinner=False)
 def get_engine():
-    global _ENGINE
-    if _ENGINE is None:
-        _ENGINE = create_engine(st.secrets["DATABASE_URL"], pool_pre_ping=True)
-    return _ENGINE
+    # Engine'i 1 kere yaratıp tüm rerunlarda reuse (performans)
+    return create_engine(st.secrets["DATABASE_URL"], pool_pre_ping=True)
 
-# --- SQLite helpers (eski düzen) ---
+
 def get_conn():
     conn = sqlite3.connect(DB_PATH)
     conn.execute("PRAGMA foreign_keys = ON;")
     return conn
 
-# --- Postgres exec/read ---
+
 def pg_exec(sql: str, params: dict | None = None):
     eng = get_engine()
     with eng.begin() as conn:
         conn.execute(text(sql), params or {})
 
+
 def pg_read(sql: str, params: dict | None = None) -> pd.DataFrame:
     eng = get_engine()
     return pd.read_sql_query(text(sql), eng, params=params or {})
 
-# ---------------- init_db ----------------
+
 def init_db():
     if using_postgres():
         pg_exec("""
@@ -89,6 +87,12 @@ def init_db():
             UNIQUE(player_id, season, scope)
         );
         """)
+
+        # indeksler: cloud performansını baya toparlar
+        pg_exec("CREATE INDEX IF NOT EXISTS idx_stats_scope_season ON stats(scope, season);")
+        pg_exec("CREATE INDEX IF NOT EXISTS idx_stats_player_season_scope ON stats(player_id, season, scope);")
+        pg_exec("CREATE INDEX IF NOT EXISTS idx_players_name ON players(name);")
+
     else:
         conn = get_conn()
         cur = conn.cursor()
@@ -116,7 +120,7 @@ def init_db():
         conn.commit()
         conn.close()
 
-# ---------------- players ----------------
+
 def upsert_player(name: str, pos: str):
     name = name.strip()
     if using_postgres():
@@ -133,16 +137,22 @@ def upsert_player(name: str, pos: str):
         conn.commit()
         conn.close()
 
-def get_players_df():
-    if using_postgres():
-        return pg_read("SELECT player_id, name, pos FROM players ORDER BY name")
-    else:
-        conn = get_conn()
-        df = pd.read_sql_query("SELECT player_id, name, pos FROM players ORDER BY name COLLATE NOCASE", conn)
-        conn.close()
-        return df
 
-# ---------------- stats ----------------
+@st.cache_data(ttl=20, show_spinner=False)
+def get_players_df_cached(is_pg: bool) -> pd.DataFrame:
+    # cache key: is_pg
+    if is_pg:
+        return pg_read("SELECT player_id, name, pos FROM players ORDER BY name")
+    conn = get_conn()
+    df = pd.read_sql_query("SELECT player_id, name, pos FROM players ORDER BY name COLLATE NOCASE", conn)
+    conn.close()
+    return df
+
+
+def get_players_df():
+    return get_players_df_cached(using_postgres())
+
+
 def upsert_stat(player_id: int, season: str, scope: str, mp: int, goals: int, assists: int, rating):
     if using_postgres():
         pg_exec("""
@@ -169,6 +179,7 @@ def upsert_stat(player_id: int, season: str, scope: str, mp: int, goals: int, as
         conn.commit()
         conn.close()
 
+
 def delete_player_season(player_id: int, season: str):
     if using_postgres():
         pg_exec("DELETE FROM stats WHERE player_id=:pid AND season=:season", {"pid": player_id, "season": season})
@@ -178,6 +189,7 @@ def delete_player_season(player_id: int, season: str):
         cur.execute("DELETE FROM stats WHERE player_id=? AND season=?", (player_id, season))
         conn.commit()
         conn.close()
+
 
 def fetch_one_stat(player_id: int, season: str, scope: str):
     if using_postgres():
@@ -198,8 +210,10 @@ def fetch_one_stat(player_id: int, season: str, scope: str):
         conn.close()
     return None if df.empty else df.iloc[0].to_dict()
 
-def fetch_stats(season: str | None, scope: str):
-    if using_postgres():
+
+@st.cache_data(ttl=20, show_spinner=False)
+def fetch_stats_cached(is_pg: bool, season: str | None, scope: str) -> pd.DataFrame:
+    if is_pg:
         q = """
         SELECT p.name, p.pos, s.season, s.scope, s.mp, s.goals, s.assists, s.rating
         FROM stats s
@@ -212,51 +226,32 @@ def fetch_stats(season: str | None, scope: str):
             params["season"] = season
         q += " ORDER BY p.pos, p.name"
         return pg_read(q, params)
-    else:
-        conn = get_conn()
-        params = [scope]
-        q = """
-        SELECT p.name, p.pos, s.season, s.scope, s.mp, s.goals, s.assists, s.rating
-        FROM stats s
-        JOIN players p ON p.player_id = s.player_id
-        WHERE s.scope = ?
-        """
-        if season and season != "Hepsi":
-            q += " AND s.season = ?"
-            params.append(season)
-        q += " ORDER BY p.pos, p.name COLLATE NOCASE"
-        df = pd.read_sql_query(q, conn, params=params)
-        conn.close()
-        return df
 
-def fetch_stats_agg(scope: str):
-    q_pg = """
-    SELECT
-        p.name,
-        p.pos,
-        SUM(s.mp) AS mp,
-        SUM(s.goals) AS goals,
-        SUM(s.assists) AS assists,
-        CASE
-            WHEN SUM(CASE WHEN s.rating IS NOT NULL THEN s.mp ELSE 0 END) > 0
-            THEN
-                SUM(CASE WHEN s.rating IS NOT NULL THEN s.rating * s.mp ELSE 0 END)
-                / SUM(CASE WHEN s.rating IS NOT NULL THEN s.mp ELSE 0 END)
-            ELSE NULL
-        END AS rating
+    conn = get_conn()
+    params = [scope]
+    q = """
+    SELECT p.name, p.pos, s.season, s.scope, s.mp, s.goals, s.assists, s.rating
     FROM stats s
     JOIN players p ON p.player_id = s.player_id
-    WHERE s.scope = :scope
-    GROUP BY p.player_id, p.name, p.pos
-    ORDER BY p.pos, p.name
+    WHERE s.scope = ?
     """
-    if using_postgres():
-        return pg_read(q_pg, {"scope": scope})
-    else:
-        conn = get_conn()
-        q_sqlite = q_pg.replace(":scope", "?") + " COLLATE NOCASE"
-        # sqlite tarafında ORDER BY satırını zaten seninki gibi bırakalım:
-        q_sqlite = """
+    if season and season != "Hepsi":
+        q += " AND s.season = ?"
+        params.append(season)
+    q += " ORDER BY p.pos, p.name COLLATE NOCASE"
+    df = pd.read_sql_query(q, conn, params=params)
+    conn.close()
+    return df
+
+
+def fetch_stats(season: str | None, scope: str):
+    return fetch_stats_cached(using_postgres(), season, scope)
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def fetch_stats_agg_cached(is_pg: bool, scope: str) -> pd.DataFrame:
+    if is_pg:
+        q = """
         SELECT
             p.name,
             p.pos,
@@ -272,13 +267,41 @@ def fetch_stats_agg(scope: str):
             END AS rating
         FROM stats s
         JOIN players p ON p.player_id = s.player_id
-        WHERE s.scope = ?
+        WHERE s.scope = :scope
         GROUP BY p.player_id, p.name, p.pos
-        ORDER BY p.pos, p.name COLLATE NOCASE
+        ORDER BY p.pos, p.name
         """
-        df = pd.read_sql_query(q_sqlite, conn, params=[scope])
-        conn.close()
-        return df
+        return pg_read(q, {"scope": scope})
+
+    conn = get_conn()
+    q = """
+    SELECT
+        p.name,
+        p.pos,
+        SUM(s.mp) AS mp,
+        SUM(s.goals) AS goals,
+        SUM(s.assists) AS assists,
+        CASE
+            WHEN SUM(CASE WHEN s.rating IS NOT NULL THEN s.mp ELSE 0 END) > 0
+            THEN
+                SUM(CASE WHEN s.rating IS NOT NULL THEN s.rating * s.mp ELSE 0 END)
+                / SUM(CASE WHEN s.rating IS NOT NULL THEN s.mp ELSE 0 END)
+            ELSE NULL
+        END AS rating
+    FROM stats s
+    JOIN players p ON p.player_id = s.player_id
+    WHERE s.scope = ?
+    GROUP BY p.player_id, p.name, p.pos
+    ORDER BY p.pos, p.name COLLATE NOCASE
+    """
+    df = pd.read_sql_query(q, conn, params=[scope])
+    conn.close()
+    return df
+
+
+def fetch_stats_agg(scope: str):
+    return fetch_stats_agg_cached(using_postgres(), scope)
+
 
 def recompute_general_for_player_season(player_id: int, season: str):
     if using_postgres():
@@ -303,8 +326,8 @@ def recompute_general_for_player_season(player_id: int, season: str):
         return
 
     mp_sum = sum(r[0] or 0 for r in rows)
-    g_sum  = sum(r[1] or 0 for r in rows)
-    a_sum  = sum(r[2] or 0 for r in rows)
+    g_sum = sum(r[1] or 0 for r in rows)
+    a_sum = sum(r[2] or 0 for r in rows)
 
     num = 0.0
     den = 0
@@ -318,27 +341,38 @@ def recompute_general_for_player_season(player_id: int, season: str):
 
     upsert_stat(player_id, season, "Genel", int(mp_sum), int(g_sum), int(a_sum), general_rating)
 
-def fetch_player_scope_season_rows(player_id: int, scope: str):
-    if using_postgres():
+    # cache invalidate (players/stats)
+    st.cache_data.clear()
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def fetch_player_scope_season_rows_cached(is_pg: bool, player_id: int, scope: str) -> pd.DataFrame:
+    if is_pg:
         return pg_read("""
             SELECT season, mp, goals, assists, rating
             FROM stats
             WHERE player_id=:pid AND scope=:scope
             ORDER BY season
         """, {"pid": player_id, "scope": scope})
-    else:
-        conn = get_conn()
-        df = pd.read_sql_query("""
-            SELECT season, mp, goals, assists, rating
-            FROM stats
-            WHERE player_id=? AND scope=?
-            ORDER BY season
-        """, conn, params=[player_id, scope])
-        conn.close()
-        return df
 
-def fetch_season_records(scope: str):
-    if using_postgres():
+    conn = get_conn()
+    df = pd.read_sql_query("""
+        SELECT season, mp, goals, assists, rating
+        FROM stats
+        WHERE player_id=? AND scope=?
+        ORDER BY season
+    """, conn, params=[player_id, scope])
+    conn.close()
+    return df
+
+
+def fetch_player_scope_season_rows(player_id: int, scope: str):
+    return fetch_player_scope_season_rows_cached(using_postgres(), player_id, scope)
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def fetch_season_records_cached(is_pg: bool, scope: str) -> pd.DataFrame:
+    if is_pg:
         return pg_read("""
             SELECT p.name, p.pos, s.season, s.mp, s.goals, s.assists, s.rating
             FROM stats s
@@ -346,17 +380,21 @@ def fetch_season_records(scope: str):
             WHERE s.scope = :scope
             ORDER BY s.season
         """, {"scope": scope})
-    else:
-        conn = get_conn()
-        df = pd.read_sql_query("""
-            SELECT p.name, p.pos, s.season, s.mp, s.goals, s.assists, s.rating
-            FROM stats s
-            JOIN players p ON p.player_id = s.player_id
-            WHERE s.scope = ?
-            ORDER BY s.season
-        """, conn, params=[scope])
-        conn.close()
-        return df
+
+    conn = get_conn()
+    df = pd.read_sql_query("""
+        SELECT p.name, p.pos, s.season, s.mp, s.goals, s.assists, s.rating
+        FROM stats s
+        JOIN players p ON p.player_id = s.player_id
+        WHERE s.scope = ?
+        ORDER BY s.season
+    """, conn, params=[scope])
+    conn.close()
+    return df
+
+
+def fetch_season_records(scope: str):
+    return fetch_season_records_cached(using_postgres(), scope)
 
 
 # ---------------- Helpers ----------------
@@ -369,7 +407,7 @@ def round_cols(df: pd.DataFrame):
         if "rating" in cl:
             d[c] = pd.to_numeric(d[c], errors="coerce").round(2)
         if "katkı" in cl or "katki" in cl:
-            d[c] = pd.to_numeric(d[c], errors="coerce").round(0)
+            d[c] = pd.to_numeric(d[c], errors="coerce").round(0).astype("Int64")
     return d
 
 
@@ -496,8 +534,12 @@ def build_xi_by_mp(df_scope: pd.DataFrame):
         if pick is None:
             result.append({"pos": pos, "name": "", "mp": None, "rating": None})
         else:
-            result.append({"pos": pos, "name": pick["name"], "mp": int(pick["mp"]),
-                           "rating": float(pick["rating"]) if pd.notna(pick["rating"]) else None})
+            result.append({
+                "pos": pos,
+                "name": pick["name"],
+                "mp": int(pick["mp"]),
+                "rating": float(pick["rating"]) if pd.notna(pick["rating"]) else None
+            })
     return pd.DataFrame(result)
 
 
@@ -519,9 +561,12 @@ def build_xi_by_rating(df_scope: pd.DataFrame, mp_offset: int):
         if pick is None:
             result.append({"pos": pos, "name": "", "rating": None, "mp": None})
         else:
-            result.append({"pos": pos, "name": pick["name"],
-                           "rating": float(pick["rating"]) if pd.notna(pick["rating"]) else None,
-                           "mp": int(pick["mp"])})
+            result.append({
+                "pos": pos,
+                "name": pick["name"],
+                "rating": float(pick["rating"]) if pd.notna(pick["rating"]) else None,
+                "mp": int(pick["mp"])
+            })
     return pd.DataFrame(result), avg_mp, threshold
 
 
@@ -548,7 +593,6 @@ def render_pitch_xi(df_xi: pd.DataFrame, mode: str):
 
         mp_txt = p.get("MP", None)
         mp_txt = "—" if mp_txt in [None, ""] else str(mp_txt)
-
         rt_txt = fmt2(p.get("Rating", None)) if p.get("Rating", None) not in [None, ""] else "—"
 
         if mode == "MP":
@@ -710,7 +754,6 @@ def render_pitch_xi(df_xi: pd.DataFrame, mode: str):
       .LW {{ grid-column: 2; grid-row: 2; }}
       .RW {{ grid-column: 4; grid-row: 2; }}
 
-      /* SF 1 hücre önde */
       .ST {{ grid-column: 3; grid-row: 1; }}
     </style>
 
@@ -799,15 +842,6 @@ div[data-testid="stMainBlockContainer"] > div:first-child {{
 
 init_db()
 
-from sqlalchemy import create_engine, text
-
-try:
-    eng = create_engine(st.secrets["DATABASE_URL"], pool_pre_ping=True)
-    cnt = pd.read_sql_query(text("SELECT COUNT(*) AS cnt FROM players"), eng)
-    st.write("players count:", int(cnt.iloc[0]["cnt"]))
-except Exception as e:
-    st.error(e)
-
 if "page" not in st.session_state:
     st.session_state["page"] = PAGES["Giriş"]
 
@@ -894,6 +928,8 @@ elif page.startswith("1)"):
             upsert_stat(pid, season, tournament, int(mp), int(goals), int(assists), float(rating))
             recompute_general_for_player_season(pid, season)
             st.success("Kaydedildi.")
+            st.cache_data.clear()
+            st.rerun()
 
 # ---------------- 2) EXISTING PLAYER ----------------
 elif page.startswith("2)"):
@@ -922,15 +958,12 @@ elif page.startswith("2)"):
                 st.session_state["selected_player_pid"] = None
                 st.session_state["selected_player_name"] = None
                 clear_searchbox_state("sb_pick_player_2")
-                # form state temizle
                 for k in ["p2_mp", "p2_goals", "p2_assists", "p2_rating", "p2_season", "p2_tournament"]:
-                    if k in st.session_state:
-                        del st.session_state[k]
+                    st.session_state.pop(k, None)
                 st.rerun()
 
         pid = int(st.session_state["selected_player_pid"])
 
-        # Form (sezon+turnuva seç, sonra DB kontrol)
         season, tournament, mp, goals, assists, rating = stat_form(defaults=None, key_prefix="p2_")
         existing = fetch_one_stat(pid, season, tournament)
 
@@ -952,8 +985,6 @@ elif page.startswith("2)"):
                 st.session_state["p2_assists"] = int(existing.get("assists", 0) or 0)
                 st.session_state["p2_rating"] = float(existing.get("rating", 6.25) or 6.25)
                 st.rerun()
-
-            st.info("Üstteki formu güncelleyip 'Kaydet / Güncelle' diyebilirsin.")
         else:
             st.warning("Bu sezon + turnuva için kayıt yok. Yeni giriş yapıyorsun.")
 
@@ -961,6 +992,8 @@ elif page.startswith("2)"):
             upsert_stat(pid, season, tournament, int(mp), int(goals), int(assists), float(rating))
             recompute_general_for_player_season(pid, season)
             st.success("Güncellendi.")
+            st.cache_data.clear()
+            st.rerun()
 
 # ---------------- 3) STATS ----------------
 elif page.startswith("3)"):
@@ -1085,6 +1118,7 @@ elif page.startswith("3)"):
             if st.button("⚠️ Bu Sezonu Komple Sil", type="secondary"):
                 delete_player_season(int(st.session_state["del_player_pid"]), del_season)
                 st.success("Silindi.")
+                st.cache_data.clear()
                 st.rerun()
 
 # ---------------- 4) PLAYER FORM ----------------
@@ -1244,8 +1278,3 @@ else:
             "rating": "Rating", "katki": "Katkı Skoru"
         }, inplace=True)
         show_df(df_ts10)
-
-
-
-
-
