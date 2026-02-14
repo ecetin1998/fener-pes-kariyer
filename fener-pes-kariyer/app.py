@@ -37,14 +37,17 @@ FENER_GREEN_LINE = "#bde5c8"
 from sqlalchemy import create_engine, text
 
 def using_postgres() -> bool:
-    return "DATABASE_URL" in st.secrets and bool(st.secrets["postgresql://postgres.ugpwrtmsblzgyopvtcss:Eoracle1717.@aws-1-eu-west-1.pooler.supabase.com:6543/postgres"])
+    try:
+        return bool(st.secrets.get("DATABASE_URL"))
+    except Exception:
+        return False
 
 _ENGINE = None
 
 def get_engine():
     global _ENGINE
     if _ENGINE is None:
-        _ENGINE = create_engine(st.secrets["postgresql://postgres.ugpwrtmsblzgyopvtcss:Eoracle1717.@aws-1-eu-west-1.pooler.supabase.com:6543/postgres"], pool_pre_ping=True)
+        _ENGINE = create_engine(st.secrets["DATABASE_URL"], pool_pre_ping=True)
     return _ENGINE
 
 # --- SQLite helpers (eski düzen) ---
@@ -1241,6 +1244,7 @@ else:
             "rating": "Rating", "katki": "Katkı Skoru"
         }, inplace=True)
         show_df(df_ts10)
+
 
 
 
